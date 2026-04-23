@@ -1,0 +1,5 @@
+{
+    "asr": { "type": "StreamingASR", "model": "qwen-asr" },
+    "llm": { "type": "OpenAIAgent", "model": "qwen-plus" },
+    "tts": { "type": "StreamingTTS", "model": "cosyvoice" }
+}
