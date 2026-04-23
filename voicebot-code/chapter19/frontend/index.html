@@ -1,0 +1,216 @@
+
+// ============================================================
+// 打断状态管理
+// ============================================================
+let isAISpeaking = false;       // AI 是否正在说话
+let audioPlayQueue = [];        // TTS 音频播放队列
+let currentSource = null;       // 当前播放的 AudioBufferSourceNode
+let playContext = null;         // AudioContext
+
+// ============================================================
+// AI 开始/结束说话时更新状态
+// ============================================================
+function onAIStartSpeaking() {
+    isAISpeaking = true;
+    setStatus("AI 正在说话（开口可打断）");
+    document.getElementById("mic-btn").classList.add("ai-speaking");
+}
+
+function onAIStopSpeaking() {
+    isAISpeaking = false;
+    setStatus("你可以说话了");
+    document.getElementById("mic-btn").classList.remove("ai-speaking");
+}
+
+// ============================================================
+// VAD：检测到用户开始说话
+// ============================================================
+function onVADStart() {
+    // 如果 AI 正在说话，立刻打断
+    if (isAISpeaking) {
+        interruptAI();
+    }
+    // 开始录音
+    startRecordingInternal();
+}
+
+// ============================================================
+// 打断函数：停止播放 + 通知服务端
+// ============================================================
+function interruptAI() {
+    console.log("打断 AI");
+
+    // 1. 停止当前正在播放的音频
+    if (currentSource) {
+        try {
+            currentSource.onended = null;  // 取消 onended 回调，防止触发 playNext
+            currentSource.stop();
+        } catch (e) {
+            // stop() 可能因为已经结束而抛出错误，忽略
+        }
+        currentSource = null;
+    }
+
+    // 2. 清空播放队列
+    audioPlayQueue = [];
+
+    // 3. 更新状态
+    isAISpeaking = false;
+
+    // 4. 通知服务端
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "interrupt" }));
+        console.log("已发送 interrupt 给服务端");
+    }
+}
+
+// ============================================================
+// 接收 TTS 音频
+// ============================================================
+ws.onmessage = async (event) => {
+    if (event.data instanceof Blob) {
+        // 收到第一帧音频时标记 AI 开始说话
+        if (!isAISpeaking) {
+            onAIStartSpeaking();
+        }
+
+        const arrayBuffer = await event.data.arrayBuffer();
+        audioPlayQueue.push(arrayBuffer);
+
+        if (!isCurrentlyPlaying()) {
+            playNext();
+        }
+    } else {
+        const data = JSON.parse(event.data);
+
+        if (data.type === "tts_end") {
+            // TTS 队列播完后 AI 说话结束
+            // 注意：不能在这里立刻 onAIStopSpeaking，因为队列里可能还有音频
+            // 应该等队列播完后再标记
+            scheduleAIStopAfterQueue();
+        } else if (data.type === "asr_result") {
+            appendMessage("user", data.text);
+        }
+    }
+};
+
+function isCurrentlyPlaying() {
+    return currentSource !== null;
+}
+
+function scheduleAIStopAfterQueue() {
+    // 在队列全部播放完毕后调用 onAIStopSpeaking
+    // playNext 中的 onended 会继续处理
+    // 我们在 playNext 里加一个标志位
+    queueEnded = true;
+}
+
+let queueEnded = false;
+
+async function playNext() {
+    if (audioPlayQueue.length === 0) {
+        currentSource = null;
+        if (queueEnded) {
+            queueEnded = false;
+            onAIStopSpeaking();
+        }
+        return;
+    }
+
+    const buffer = audioPlayQueue.shift();
+
+    if (!playContext || playContext.state === "closed") {
+        playContext = new AudioContext({ sampleRate: 24000 });
+    }
+
+    try {
+        // 解码 PCM 数据
+        const pcm = new Int16Array(buffer);
+        const float32 = new Float32Array(pcm.length);
+        for (let i = 0; i < pcm.length; i++) {
+            float32[i] = pcm[i] / 32768.0;
+        }
+
+        const audioBuffer = playContext.createBuffer(1, float32.length, 24000);
+        audioBuffer.copyToChannel(float32, 0);
+
+        currentSource = playContext.createBufferSource();
+        currentSource.buffer = audioBuffer;
+        currentSource.connect(playContext.destination);
+        currentSource.onended = playNext;  // 播完自动播下一段
+        currentSource.start();
+
+    } catch (err) {
+        console.error("播放失败:", err);
+        currentSource = null;
+        playNext();  // 跳过这段，继续播放
+    }
+}
+
+// ============================================================
+// VAD 实现（简化版，基于音量检测）
+// ============================================================
+let silenceTimer = null;
+let isSpeaking = false;
+
+function setupVAD(stream) {
+    const audioCtx = new AudioContext({ sampleRate: 16000 });
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+
+    const buffer = new Uint8Array(analyser.fftSize);
+    const SILENCE_THRESHOLD = 20;    // 音量阈值（0-255）
+    const SPEECH_MIN_MS = 200;       // 说话持续至少这么长才算有效
+    const SILENCE_TRIGGER_MS = 500;  // 静音这么长后判定说话结束
+
+    let speechStart = null;
+
+    function check() {
+        analyser.getByteTimeDomainData(buffer);
+
+        // 计算 RMS 音量
+        let sum = 0;
+        for (let i = 0; i < buffer.length; i++) {
+            const x = (buffer[i] - 128) / 128.0;
+            sum += x * x;
+        }
+        const rms = Math.sqrt(sum / buffer.length) * 255;
+        const hasVoice = rms > SILENCE_THRESHOLD;
+
+        if (hasVoice) {
+            if (!isSpeaking) {
+                // 用户开始说话
+                isSpeaking = true;
+                speechStart = Date.now();
+                clearTimeout(silenceTimer);
+                silenceTimer = null;
+                onVADStart();  // 触发打断 + 录音
+            } else {
+                // 继续说话，重置静音计时器
+                clearTimeout(silenceTimer);
+                silenceTimer = null;
+            }
+        } else {
+            if (isSpeaking && !silenceTimer) {
+                silenceTimer = setTimeout(() => {
+                    // 说话结束
+                    isSpeaking = false;
+                    silenceTimer = null;
+                    const duration = Date.now() - speechStart;
+                    if (duration >= SPEECH_MIN_MS) {
+                        onVADEnd();  // 触发 ASR
+                    } else {
+                        // 太短，可能是噪音，取消录音
+                        cancelRecording();
+                    }
+                }, SILENCE_TRIGGER_MS);
+            }
+        }
+
+        requestAnimationFrame(check);
+    }
+
+    check();
+}

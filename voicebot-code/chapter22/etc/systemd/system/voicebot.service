@@ -1,0 +1,40 @@
+
+[Unit]
+Description=VoiceBot Voice AI Server
+Documentation=https://github.com/yourname/voicebot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=voicebot
+Group=voicebot
+WorkingDirectory=/opt/voicebot
+
+# 环境变量（或用 EnvironmentFile）
+EnvironmentFile=/opt/voicebot/.env
+
+# 启动命令
+ExecStart=/opt/voicebot/.venv/bin/python -m voicebot --config /opt/voicebot/config.json
+
+# 崩溃后自动重启
+Restart=always
+RestartSec=5s
+StartLimitBurst=5         # 5 分钟内最多重启 5 次
+StartLimitInterval=300s   # 超过限制则停止尝试（发告警）
+
+# 资源限制
+LimitNOFILE=65536         # 最大文件描述符数（WebSocket 连接需要）
+LimitNPROC=4096
+
+# 日志设置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voicebot
+
+# 优雅关闭
+KillMode=mixed
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target
